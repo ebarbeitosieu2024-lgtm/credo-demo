@@ -37,6 +37,11 @@ HOST = os.environ.get("HOST", "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 DB_LOCK = threading.Lock()
 
+try:  # web files bundled by build_assets.py, used when static/ is not deployed
+    from assets import ASSETS
+except ImportError:
+    ASSETS = {}
+
 DOC_TYPES = {
     "transcript": "Academic transcript",
     "diploma": "Diploma",
@@ -1785,14 +1790,22 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, b'{"ok":true}', extra=[("Set-Cookie", "credo_session=; Path=/; Max-Age=0")])
 
     def _static(self, path):
-        if path in ("", "/"):
-            path = "/index.html"
-        full = os.path.normpath(os.path.join(STATIC_DIR, path.lstrip("/")))
-        if not full.startswith(STATIC_DIR) or not os.path.isfile(full):
-            full = os.path.join(STATIC_DIR, "index.html")
-        with open(full, "rb") as f:
-            data = f.read()
-        mime = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        rel = path.lstrip("/") or "index.html"
+        full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+        if full.startswith(STATIC_DIR + os.sep) and os.path.isfile(full):
+            with open(full, "rb") as f:
+                data = f.read()
+        elif rel in ASSETS:  # deployed without the static/ folder: use the bundled copy
+            data = ASSETS[rel].encode("utf-8")
+        else:
+            rel = "index.html"
+            index = os.path.join(STATIC_DIR, rel)
+            if os.path.isfile(index):
+                with open(index, "rb") as f:
+                    data = f.read()
+            else:
+                data = ASSETS[rel].encode("utf-8")
+        mime = mimetypes.guess_type(rel)[0] or "application/octet-stream"
         if mime.startswith("text/") or mime.endswith("javascript"):
             mime += "; charset=utf-8"
         self._send(200, data, mime)

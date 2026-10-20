@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Credo MVP server — verified universal application platform.
 
-Python standard library only (http.server + sqlite3). Run:  python3 server.py
+Python standard library + optional Postgres. Run:  python3 server.py
+Set DATABASE_URL to a Postgres connection string to keep data permanently (needed on Render);
+without it, data is stored in data/app.db (SQLite).
 Then open http://localhost:8787
 
 Real in this MVP: SHA-256 integrity hashing re-checked on every view, revocation and
@@ -61,7 +63,7 @@ CREATE TABLE IF NOT EXISTS users(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, role TEXT NOT NULL,
   headline TEXT, location TEXT, phone TEXT, summary TEXT, languages TEXT DEFAULT '[]',
   profile TEXT DEFAULT '{}', settings TEXT DEFAULT '{}', identity_level TEXT, identity_method TEXT,
-  signing_key TEXT, is_demo INTEGER DEFAULT 0, created_at TEXT);
+  signing_key TEXT, is_demo INTEGER DEFAULT 0, created_at TEXT, password_hash TEXT);
 CREATE TABLE IF NOT EXISTS organizations(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, domain TEXT, country TEXT,
   verification_status TEXT NOT NULL, verified_at TEXT, signing_key TEXT, description TEXT, created_at TEXT);
@@ -72,7 +74,7 @@ CREATE TABLE IF NOT EXISTS credentials(
   id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL,
   subject_user_id TEXT NOT NULL REFERENCES users(id), issuer_org_id TEXT REFERENCES organizations(id),
   issuer_user_id TEXT REFERENCES users(id), issuer_name TEXT, source TEXT NOT NULL,
-  content TEXT, file_path TEXT, file_name TEXT, mime TEXT,
+  content TEXT, file_path TEXT, file_data TEXT, file_name TEXT, mime TEXT,
   issued_at TEXT, expires_at TEXT, status TEXT NOT NULL, revoked_at TEXT, revocation_reason TEXT,
   integrity_hash TEXT, signature TEXT, sig_key_ref TEXT, signature_method TEXT, verification_method TEXT,
   confidential INTEGER DEFAULT 0, reuse_policy TEXT DEFAULT 'any', permitted_recipients TEXT DEFAULT '[]',
@@ -146,11 +148,72 @@ def sha256_bytes(b):
     return hashlib.sha256(b).hexdigest()
 
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+TABLES = ["sessions", "notifications", "audit_logs", "access_grants", "packages", "application_requirements",
+          "applications", "programs", "document_requests", "recommendation_requests", "credentials", "org_members",
+          "organizations", "users"]
+
+
+class PgConn:
+    """Makes a psycopg connection accept the SQLite-style SQL used in this file (? placeholders)."""
+
+    def __init__(self, raw):
+        self.raw = raw
+
+    def execute(self, sql, args=()):
+        ignore = "INSERT OR IGNORE" in sql
+        sql = sql.replace("INSERT OR IGNORE", "INSERT").replace("?", "%s")
+        if ignore:
+            sql += " ON CONFLICT DO NOTHING"
+        cur = self.raw.cursor()
+        cur.execute(sql, tuple(args))
+        return cur
+
+    def executescript(self, script):
+        for stmt in script.split(";"):
+            if stmt.strip():
+                self.raw.execute(stmt)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        pass  # one shared connection, reused across requests (requests are serialized by DB_LOCK)
+
+
+_pg = None
+
+
 def db():
+    global _pg
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+        if _pg is None or _pg.raw.closed or _pg.raw.broken:
+            _pg = PgConn(psycopg.connect(DATABASE_URL, row_factory=dict_row))
+        return _pg
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def hash_password(pw):
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, 200000)
+    return "pbkdf2_sha256$200000$%s$%s" % (salt.hex(), dk.hex())
+
+
+def check_password(pw, stored):
+    try:
+        _, rounds, salt, digest = (stored or "").split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), int(rounds))
+        return hmac.compare_digest(dk.hex(), digest)
+    except ValueError:
+        return False
 
 
 def one(conn, sql, *args):
@@ -188,6 +251,8 @@ def notify(conn, user_id, title, body, link=""):
 # ---------------------------------------------------------------- verification primitives
 
 def credential_bytes(row):
+    if row.get("file_data"):
+        return base64.b64decode(row["file_data"])
     if row.get("file_path"):
         p = os.path.join(FILES_DIR, row["file_path"])
         if not os.path.exists(p):
@@ -291,10 +356,14 @@ def serialize_credential(conn, row, viewer=None, force_content=None, with_checks
         "issuer_org": org, "issuer_user": issuer_user,
         "checks": {"integrity": integrity, "signature": sig},
         "can_view_content": bool(can_content), "access_reason": reason,
-        "has_file": bool(row.get("file_path")),
-        "content": row["content"] if (can_content and not row.get("file_path")) else None,
+        "has_file": is_file(row),
+        "content": row["content"] if (can_content and not is_file(row)) else None,
     })
     return out
+
+
+def is_file(row):
+    return bool(row.get("file_path") or row.get("file_data"))
 
 
 def store_file(data, file_name):
@@ -312,12 +381,12 @@ def create_credential(conn, *, type, title, subject_id, source, status, content=
                       verification_method=None, confidential=0, reuse_policy="any", permitted=None,
                       metadata=None, simulated=1):
     cid = uid("cred")
-    file_path = store_file(file_bytes, file_name) if file_bytes is not None else None
+    file_data = base64.b64encode(file_bytes).decode() if file_bytes is not None else None
     data = file_bytes if file_bytes is not None else (content or "").encode("utf-8")
     row = {
         "id": cid, "type": type, "title": title, "subject_user_id": subject_id,
         "issuer_org_id": issuer_org_id, "issuer_user_id": issuer_user_id, "issuer_name": issuer_name,
-        "source": source, "content": content if file_bytes is None else None, "file_path": file_path,
+        "source": source, "content": content if file_bytes is None else None, "file_path": None, "file_data": file_data,
         "file_name": file_name, "mime": mime, "issued_at": issued_at or now(), "expires_at": expires_at,
         "status": status, "revoked_at": None, "revocation_reason": None,
         "integrity_hash": sha256_bytes(data), "signature": None, "sig_key_ref": sig_key_ref,
@@ -738,14 +807,24 @@ def h_personas(conn, user, body, params):
     return {"personas": rows}
 
 
-def h_login(conn, user, body, params):
-    u = one(conn, "SELECT * FROM users WHERE id=?", body.get("user_id"))
-    if not u:
-        raise ApiError(404, "Unknown demo user")
+def start_session(conn, u, how):
     token = secrets.token_urlsafe(32)
     conn.execute("INSERT INTO sessions VALUES(?,?,?)", (token, u["id"], now()))
-    audit(conn, u, "session.signin", "user", u["id"], "Demo persona sign-in", u["id"] if u["role"] == "applicant" else None)
+    audit(conn, u, "session.signin", "user", u["id"], how, u["id"] if u["role"] == "applicant" else None)
     return {"_set_session": token, **session_payload(conn, u)}
+
+
+def h_login(conn, user, body, params):
+    if body.get("user_id"):  # demo persona (fictional seed accounts only)
+        u = one(conn, "SELECT * FROM users WHERE id=? AND is_demo=1", body["user_id"])
+        if not u:
+            raise ApiError(404, "Unknown demo user")
+        return start_session(conn, u, "Demo persona sign-in")
+    email = (body.get("email") or "").strip().lower()
+    u = one(conn, "SELECT * FROM users WHERE email=?", email)
+    if not u or not check_password(body.get("password") or "", u.get("password_hash")):
+        raise ApiError(401, "Incorrect email or password.")
+    return start_session(conn, u, "Email + password sign-in")
 
 
 def h_logout(conn, user, body, params):
@@ -755,8 +834,11 @@ def h_logout(conn, user, body, params):
 def h_signup(conn, user, body, params):
     name = (body.get("name") or "").strip()
     email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
     if len(name) < 2 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         raise ApiError(400, "Enter your full name and a valid email address.")
+    if len(password) < 8:
+        raise ApiError(400, "Choose a password with at least 8 characters.")
     if one(conn, "SELECT id FROM users WHERE email=?", email):
         raise ApiError(409, "An account with this email already exists.")
     uid_ = uid("usr")
@@ -767,19 +849,17 @@ def h_signup(conn, user, body, params):
                                      "degree": edu.get("degree", ""), "field": edu.get("field", ""),
                                      "start": edu.get("start", ""), "end": edu.get("end", ""), "result": "", "achievements": []})
     conn.execute("""INSERT INTO users(id,name,email,role,headline,location,summary,languages,profile,settings,
-        identity_level,identity_method,signing_key,is_demo,created_at) VALUES(?,?,?,'applicant',?,?,?,?,?,?,?,?,?,0,?)""",
+        identity_level,identity_method,signing_key,is_demo,created_at,password_hash) VALUES(?,?,?,'applicant',?,?,?,?,?,?,?,?,?,0,?,?)""",
                  (uid_, name, email, body.get("headline", ""), body.get("location", ""), "", "[]", json.dumps(profile),
                   json.dumps({"profile_visibility": "private", "default_share_days": 30, "notify_email": True,
                               "notify_deadlines": True, "allow_reuse_prompts": True, "two_factor": False}),
-                  "basic", "Email confirmation (simulated)", secrets.token_hex(32), now()))
+                  "basic", "Email + password (email not yet confirmed)", secrets.token_hex(32), now(), hash_password(password)))
     u = one(conn, "SELECT * FROM users WHERE id=?", uid_)
     for pid in body.get("program_ids") or []:
         add_application(conn, uid_, pid)
     audit(conn, u, "account.created", "user", uid_, "Applicant signup", uid_)
-    notify(conn, uid_, "Welcome to Credo", "Start by requesting your transcript and a recommendation.", "#/request")
-    token = secrets.token_urlsafe(32)
-    conn.execute("INSERT INTO sessions VALUES(?,?,?)", (token, uid_, now()))
-    return {"_set_session": token, **session_payload(conn, u)}
+    notify(conn, uid_, "Welcome to Credo", "Add your CV to your vault, then request your transcript and a reference.", "/app")
+    return start_session(conn, u, "New account")
 
 
 def h_orgs(conn, user, body, params):
@@ -976,7 +1056,7 @@ def h_download(conn, user, body, params):
 
 def file_response(row):
     data = credential_bytes(row) or b""
-    if row.get("file_path"):
+    if is_file(row):
         name = row.get("file_name") or "document"
         mime = row.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream"
     else:
@@ -1425,7 +1505,7 @@ def h_org_overview(conn, user, body, params):
         if d["type"] == "verify_upload" and d["credential_id"]:
             c = one(conn, "SELECT * FROM credentials WHERE id=?", d["credential_id"])
             d["upload"] = {"title": c["title"], "file_name": c["file_name"], "integrity_hash": c["integrity_hash"],
-                           "content": c["content"] if not c["file_path"] else None, "id": c["id"]} if c else None
+                           "content": c["content"] if not is_file(c) else None, "id": c["id"]} if c else None
     issued = [serialize_credential(conn, r, user) for r in many(conn,
               "SELECT * FROM credentials WHERE issuer_org_id=? AND source='issuer' ORDER BY issued_at DESC", org["id"])]
     for c in issued:
@@ -1625,7 +1705,7 @@ def h_admin_org(conn, user, body, params):
 def h_admin_tamper(conn, user, body, params):
     """Demo only: corrupts a stored credential so the integrity check visibly fails."""
     row = one(conn, "SELECT * FROM credentials WHERE id=?", params["id"])
-    if not row or row["file_path"]:
+    if not row or is_file(row):
         raise ApiError(400, "Pick a text credential")
     if body.get("restore") and row["content"].endswith("\n[tampered]"):
         conn.execute("UPDATE credentials SET content=? WHERE id=?", (row["content"][:-len("\n[tampered]")], row["id"]))
@@ -1734,6 +1814,8 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             return self._static(path)
         if method == "POST" and path == "/api/demo/reset":
+            if DATABASE_URL:  # hosted: real accounts live here, so never allow a wipe from the web
+                return self._send(403, json.dumps({"error": "Reset is disabled on the hosted site."}).encode())
             return self._reset()
         for m, rx, fn, roles in COMPILED:
             mt = rx.match(path)
@@ -1768,7 +1850,8 @@ class Handler(BaseHTTPRequestHandler):
                                       [("Content-Disposition", 'attachment; filename="%s"' % result["_filename"])])
                 extra = []
                 if isinstance(result, dict) and result.get("_set_session"):
-                    extra.append(("Set-Cookie", "credo_session=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800" % result.pop("_set_session")))
+                    secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+                    extra.append(("Set-Cookie", "credo_session=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000%s" % (result.pop("_set_session"), secure)))
                 if isinstance(result, dict) and result.pop("_clear_session", None):
                     extra.append(("Set-Cookie", "credo_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"))
                 return self._send(200, json.dumps(result, default=str).encode(), extra=extra)
@@ -1784,7 +1867,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _reset(self):
         with DB_LOCK:
-            if os.path.exists(DB_PATH):
+            if DATABASE_URL:
+                conn = db()
+                for t in TABLES:
+                    conn.execute("DROP TABLE IF EXISTS %s CASCADE" % t)
+                conn.commit()
+            elif os.path.exists(DB_PATH):
                 os.remove(DB_PATH)
             init_db()
         self._send(200, b'{"ok":true}', extra=[("Set-Cookie", "credo_session=; Path=/; Max-Age=0")])
@@ -1830,7 +1918,15 @@ def init_db():
     os.makedirs(FILES_DIR, exist_ok=True)
     conn = db()
     conn.executescript(SCHEMA)
+    conn.commit()
+    for table, col in [("users", "password_hash"), ("credentials", "file_data")]:  # upgrade older databases
+        try:
+            conn.execute("ALTER TABLE %s ADD COLUMN %s TEXT" % (table, col))
+            conn.commit()
+        except Exception:
+            conn.rollback()
     seed(conn)
+    conn.commit()
     conn.close()
 
 

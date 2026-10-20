@@ -1,1 +1,2 @@
-# No third-party packages needed: the app uses only the Python standard library.
+# psycopg is only used when DATABASE_URL is set (Postgres on Render). Locally the app runs on the standard library.
+psycopg[binary]>=3.1
